@@ -1068,7 +1068,9 @@ struct PetView: View {
                     },
                     menuEntries: avatarMenuEntries
                 )
-                .frame(width: 78, height: 104)
+                // 热区只盖住缩放后实际画出来的头像（78×104 × 0.8 ≈ 62×83），
+                // 四周不留隐形区域，避免挡住桌宠底下其他 App 的按钮。
+                .frame(width: 62, height: 84)
             }
             .help("长按头像拖动可移动爱音，点一下展开清单")
         }
