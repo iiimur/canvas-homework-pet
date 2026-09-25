@@ -778,10 +778,16 @@ final class PetPanelController: NSObject, NSApplicationDelegate {
     /// 两类形态都要覆盖：原生全屏窗口恰好等于整屏；浏览器网页全屏（B 站等）的窗口
     /// 会留出顶部菜单栏条、底边贴屏幕底。网页全屏窗口常挂在非 0 层级，因此不筛选层级，
     /// 直接把窗口边界和 CG 显示器边界（同为左上原点坐标系）比对。
+    /// 光看几何会把普通桌面上的平铺/最大化窗口误判成全屏，所以额外要求菜单栏窗口
+    /// （层 24）不在屏：原生全屏 Space 会把菜单栏整个藏起来，满铺窗口做不到。
     private func isAppFullScreen(pid: pid_t) -> Bool {
         guard let rows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
             return false
         }
+        let menuBarOnscreen = rows.contains {
+            ($0[kCGWindowLayer as String] as? Int) == Int(kCGMainMenuWindowLevel)
+        }
+        if menuBarOnscreen { return false }
         let slack: CGFloat = 12
         let displays = NSScreen.screens.compactMap { screen -> (CGRect, CGFloat)? in
             guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { return nil }
@@ -829,6 +835,8 @@ final class PetPanelController: NSObject, NSApplicationDelegate {
 
     /// 全屏看视频时像系统光标一样自动隐藏；鼠标一动或退出全屏就淡回来。
     private func setPanelHidden(_ hidden: Bool) {
+        // 兜底：任何路径把面板 orderOut 之后状态机又回到可见态时，这里负责把它拉回屏幕。
+        if !hidden, !panel.isVisible { panel.orderFrontRegardless() }
         guard isAutoHidden != hidden else { return }
         isAutoHidden = hidden
         if hidden {
