@@ -1,5 +1,7 @@
 # 课程作业桌宠
 
+<img width="228" height="104" alt="截屏2026-09-25 10 59 22" src="https://github.com/user-attachments/assets/7ad176c1-7857-4769-b6ec-71ea272781d0" />
+
 macOS 原生悬浮桌宠，常驻桌面角落。点击角色展开作业卡片，可以看 Canvas 作业要求并直接打开对应页面。长按头像拖动可移动桌宠。
 
 爱音会按前台 App 记住遮挡位置。首次遇到某个 App 时先停在桌面默认位置；长按头像拖动调整位置，松手即自动保存为该 App 的记忆点，下次切回时恢复。
@@ -7,6 +9,9 @@ macOS 原生悬浮桌宠，常驻桌面角落。点击角色展开作业卡片�
 桌宠采用 `Sources/Resources/anon_head.png` 中的头像素材。更换外观时替换该 PNG 并保持文件名不变，再重新构建即可。移动时显示 `anon_angry.webp`；当最近的未交作业剩余提交时间不足 3 小时（含已逾期）时，切换为 `anon_tired.png` 的疲惫贴图。
 
 应用图标使用同一张 `anon_head` 表情，图标源文件在 `Resources/AppIcon.iconset/`。
+
+<img width="357" height="542" alt="截屏2026-09-25 11 00 44" src="https://github.com/user-attachments/assets/4ec05f4c-6cfb-4334-a54d-86940865b174" />
+
 
 ## 系统要求
 
