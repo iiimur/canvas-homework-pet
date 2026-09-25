@@ -404,6 +404,9 @@ final class PetPanelController: NSObject, NSApplicationDelegate {
     private var lastAppWindowFrame: NSRect?
     private var lastPositionedBundleID: String?
     private var lastPositionedWindowFrame: NSRect?
+    /// 60Hz 跟随锁定的前台窗口；由 1 秒慢速轮询选定，快速路径只查它一个。
+    private struct TrackedWindow { let id: CGWindowID; let pid: pid_t }
+    private var trackedWindow: TrackedWindow?
     private var anchors: [String: AppPetAnchor] = [:]
     private var manuallyMovedBundleIDs = Set<String>()
     private var defaultOrigin = NSPoint.zero
@@ -416,6 +419,8 @@ final class PetPanelController: NSObject, NSApplicationDelegate {
     private var appActivationObserver: NSObjectProtocol?
     private var frontmostApplicationObservation: NSKeyValueObservation?
     private var mouseActivityMonitor: Any?
+    /// mouseMoved 节流时间戳（全局监听回调在主线程串行触发，无需加锁）。
+    nonisolated(unsafe) private var lastMoveHandledTimestamp: CFTimeInterval = -1
     private let anchorsKey = "appPetAnchors"
     private let avatarCenterInCompactPanel = NSPoint(x: 183, y: 75)
     let ambient = AmbientState()
@@ -430,7 +435,9 @@ final class PetPanelController: NSObject, NSApplicationDelegate {
     /// 中间任何一次展开/收起清单都会把桌宠弹回旧锚点，刚拖的位置就丢了。
     private func finishManualDrag() {
         ambient.isMoving = false
-        guard let bundleID = lastAppBundleID, let frame = lastAppWindowFrame else { return }
+        guard let bundleID = lastAppBundleID, let frame = lastAppWindowFrame else {
+            return
+        }
         saveAnchor(bundleID: bundleID, appName: lastAppName ?? bundleID, windowFrame: frame)
         restingOrigin = panel.frame.origin
     }
@@ -504,17 +511,34 @@ final class PetPanelController: NSObject, NSApplicationDelegate {
             guard let app = change.newValue ?? nil else { return }
             Task { @MainActor in self?.applicationDidActivate(app) }
         }
-        // 轮询只为捕捉前台应用窗口的移动/缩放；App 切换已有通知驱动，这里 1 秒足够。
+        // 慢速轮询负责认窗口、App 切换收尾这类状态；窗口的实时贴附由拖动事件驱动。
         let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.updateAppPosition() }
         }
         positionTimer = timer
         RunLoop.main.add(timer, forMode: .common)
         // 全屏自动隐藏要像系统光标一样即时恢复，鼠标一动就立刻感知，不等 1 秒轮询。
+        // 按下/拖动/抬起驱动"胶水模式"：按下锁定光标下的窗口，拖动确认后爱音像
+        // 被鼠标直接拖走一样贴附。
         mouseActivityMonitor = NSEvent.addGlobalMonitorForEvents(
-            matching: [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]
-        ) { [weak self] _ in
-            Task { @MainActor in self?.noteMouseActivity() }
+            matching: [.mouseMoved, .leftMouseDown, .leftMouseUp, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]
+        ) { [weak self] event in
+            guard let self else { return }
+            // mouseMoved 事件量极大且只服务于全屏自动隐藏，20ms 节流足够；
+            // 拖动类事件逐个驱动胶水跟随，不能节流。
+            if event.type == .mouseMoved {
+                guard event.timestamp - lastMoveHandledTimestamp > 0.02 else { return }
+                lastMoveHandledTimestamp = event.timestamp
+            }
+            Task { @MainActor in
+                switch event.type {
+                case .leftMouseDown: self.glueMouseDown()
+                case .leftMouseUp: self.glueMouseUp()
+                case .leftMouseDragged: self.glueMouseDragged()
+                default: break
+                }
+                self.noteMouseActivity()
+            }
         }
         updateAppPosition()
         // 清单展开时，点击面板外的任何位置都收起清单。面板自身的点击属于本地事件，不会进入全局监听。
@@ -711,7 +735,7 @@ final class PetPanelController: NSObject, NSApplicationDelegate {
         let isFullScreen = isAppFullScreen(pid: app.processIdentifier)
         setFrontAppFullScreen(isFullScreen)
 
-        guard let frame = frontWindowFrame(for: app.processIdentifier) else {
+        guard let (frame, windowID) = frontWindowFrame(for: app.processIdentifier) else {
             // 全屏播放器场景下可能没有普通层级窗口可锚定；此时桌宠保持原地（随后自动隐藏）。
             if !isFullScreen {
                 restoreRestingPositionIfNeeded()
@@ -721,9 +745,11 @@ final class PetPanelController: NSObject, NSApplicationDelegate {
                 }
             }
             lastAppWindowFrame = nil
+            trackedWindow = nil
             return
         }
         lastAppWindowFrame = frame
+        trackedWindow = TrackedWindow(id: windowID, pid: app.processIdentifier)
 
         guard anchors[bundleID] != nil else {
             restoreRestingPositionIfNeeded()
@@ -755,26 +781,214 @@ final class PetPanelController: NSObject, NSApplicationDelegate {
         }
 
         guard let anchor = anchors[bundleID] else { return }
-        // 仅在切换 App 或其窗口移动/缩放时自动飞过去；允许用户在该 App 前台时手动微调。
-        if lastPositionedBundleID != bundleID || lastPositionedWindowFrame != frame {
-            let targetCenter = NSPoint(
-                x: frame.maxX - anchor.distanceFromRight,
-                y: frame.maxY - anchor.distanceFromTop
-            )
-            let targetOrigin = NSPoint(
-                x: targetCenter.x - avatarCenterInCompactPanel.x,
-                y: targetCenter.y - avatarCenterInCompactPanel.y
-            )
-            let safeTarget = clamp(NSRect(origin: targetOrigin, size: panel.frame.size), toScreenNear: targetOrigin).origin
-            // restingOrigin 是展开清单时的基准位置，必须跟着锚点一起走，
-            // 否则自动移动后展开，清单还会弹回移动前的旧位置。
-            restingOrigin = safeTarget
-            if hypot(panel.frame.origin.x - safeTarget.x, panel.frame.origin.y - safeTarget.y) > 4 {
-                glide(to: safeTarget)
+        // 胶水模式进行中：位置完全由拖动事件驱动，慢速轮询不插手，
+        // 否则它会把爱音拽回窗口实际位置、和手拉扯，产生周期性抖动。
+        if glueActive { return }
+        // 大幅位置变化（切换 App）滑过去；窗口自身的拖动/缩放由拖动事件贴附，
+        // 这里只兜底处理慢速轮询期间窗口被换掉的情况。
+        if lastPositionedBundleID != bundleID {
+            attach(toWindowFrame: frame, anchor: anchor, bundleID: bundleID, animated: true)
+        } else if lastPositionedWindowFrame != frame {
+            // Space 切换动画期间窗口 frame 会横扫整屏，那是动画中间帧不是真实位置，
+            // 单次位移超 350pt 的跳变无视，等停稳后的下一轮再就位。
+            if let previous = lastPositionedWindowFrame,
+               hypot(frame.origin.x - previous.origin.x, frame.origin.y - previous.origin.y) > 350 {
+                return
             }
-            lastPositionedBundleID = bundleID
-            lastPositionedWindowFrame = frame
+            attach(toWindowFrame: frame, anchor: anchor, bundleID: bundleID, animated: false)
         }
+    }
+
+    /// 把桌宠贴到窗口 frame 对应的锚点上，返回实际落点。
+    /// animated 用于 App 切换这类大跳变（滑行过去）；同一窗口的连续移动直接落位。
+    @discardableResult
+    private func attach(toWindowFrame frame: NSRect, anchor: AppPetAnchor, bundleID: String, animated: Bool) -> NSPoint {
+        let targetCenter = NSPoint(
+            x: frame.maxX - anchor.distanceFromRight,
+            y: frame.maxY - anchor.distanceFromTop
+        )
+        let targetOrigin = NSPoint(
+            x: targetCenter.x - avatarCenterInCompactPanel.x,
+            y: targetCenter.y - avatarCenterInCompactPanel.y
+        )
+        let safeTarget = clamp(NSRect(origin: targetOrigin, size: panel.frame.size), toScreenNear: targetOrigin).origin
+        // restingOrigin 是展开清单时的基准位置，必须跟着锚点一起走，
+        // 否则自动移动后展开，清单还会弹回移动前的旧位置。
+        restingOrigin = safeTarget
+        if animated {
+            glide(to: safeTarget)
+        } else {
+            panel.setFrameOrigin(safeTarget)
+        }
+        lastPositionedBundleID = bundleID
+        lastPositionedWindowFrame = frame
+        return safeTarget
+    }
+
+    // MARK: 胶水模式：拖动窗口时爱音像被鼠标直接拖走一样贴附
+
+    /// 确认逻辑不依赖按下时刻的状态，只比较相邻两次采样：窗口位移和鼠标位移
+    /// 一致即进入胶水模式（两三个事件内），之后每个拖动事件只用鼠标位移推算
+    /// 爱音位置——纯算术、零延迟，和拖动爱音本体的手感一致。每 0.15 秒查一次
+    /// 窗口校验，窗口撞边停住、Space 动画等情况自动退出。
+    private var glueActive = false
+    private var glueLastMouse: NSPoint?
+    private var glueLastVerify = Date.distantPast
+    private var glueLastQuery = Date.distantPast
+    /// 确认阶段的会话起点：0.5 秒内没确认成窗口拖动就停止查询（下次按下重置）。
+    private var glueActiveSince: Date?
+    /// 按下时刻的窗口位置和鼠标位置：首个拖动事件据此判断"窗口因按下而动了"。
+    private var glueFrameAtDown: NSRect?
+    private var glueMouseAtDown: NSPoint?
+    /// 校验用的上次窗口位置和鼠标位置：只用来发现"窗口停了鼠标还在动"。
+    private var glueLastVerifiedFrame: NSRect?
+    private var glueVerifyMouse: NSPoint?
+    /// 按下瞬间锁定的光标下窗口：拖动它时爱音贴附。不挑"最大的窗口"，
+    /// App 开着多个窗口时拖哪个都正确。
+    private var glueTracked: TrackedWindow?
+
+    /// 按下瞬间锁定光标下最前面的普通窗口（层 0）作为候选拖动目标。
+    private func glueMouseDown() {
+        glueActive = false
+        glueActiveSince = nil
+        glueLastVerifiedFrame = nil
+        glueVerifyMouse = nil
+        glueTracked = nil
+        glueFrameAtDown = nil
+        glueMouseAtDown = NSEvent.mouseLocation
+        glueLastQuery = .distantPast  // 第一个拖动事件立即查询，不等节流
+        let pos = NSEvent.mouseLocation
+        guard let rows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return }
+        for row in rows {
+            guard (row[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
+                  let bounds = row[kCGWindowBounds as String] as? NSDictionary,
+                  let cgRect = CGRect(dictionaryRepresentation: bounds),
+                  let frame = convertedWindowFrame(from: cgRect),
+                  frame.contains(pos),
+                  let id = (row[kCGWindowNumber as String] as? NSNumber)?.uint32Value,
+                  let pid = (row[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value else { continue }
+            glueTracked = TrackedWindow(id: id, pid: pid)
+            glueFrameAtDown = frame
+            return
+        }
+    }
+
+    /// 拖动窗口所属 App 的锚点；找不到（首次见面）则返回 nil，胶水不参与。
+    private func glueAnchor() -> (bundleID: String, anchor: AppPetAnchor)? {
+        guard let tracked = glueTracked,
+              let bundleID = NSRunningApplication(processIdentifier: tracked.pid)?.bundleIdentifier,
+              let anchor = anchors[bundleID] else { return nil }
+        return (bundleID, anchor)
+    }
+
+    private func glueMouseDragged() {
+        guard !isExpanded, !isExpandedManuallyMoved, glueTracked != nil else { return }
+        let pos = NSEvent.mouseLocation
+
+        if glueActive {
+            // 胶水模式：爱音位置 = 自己当前位置 + 鼠标位移，和手完全同步。
+            guard let session = glueAnchor() else {
+                glueActive = false
+                ambient.isMoving = false
+                return
+            }
+            guard let last = glueLastMouse else { glueLastMouse = pos; return }
+            panel.setFrameOrigin(NSPoint(
+                x: panel.frame.origin.x + (pos.x - last.x),
+                y: panel.frame.origin.y + (pos.y - last.y)
+            ))
+            glueLastMouse = pos
+            // 定期校验只探测"窗口停住而鼠标还在动"（撞屏幕边缘、系统接管）：
+            // 这种情况退出胶水吸回锚点。其余时候绝不修正位置——爱音跟手，
+            // 与窗口之间几个点的固有多媒体延迟差不需要也不应该去追。
+            if Date().timeIntervalSince(glueLastVerify) > 0.15, let frame = windowFrame(of: glueTracked!) {
+                glueLastVerify = Date()
+                defer { glueLastVerifiedFrame = frame; glueVerifyMouse = pos }
+                if let lastFrame = glueLastVerifiedFrame, let lastMouse = glueVerifyMouse {
+                    let windowMoved = hypot(frame.origin.x - lastFrame.origin.x, frame.origin.y - lastFrame.origin.y)
+                    let mouseMoved = hypot(pos.x - lastMouse.x, pos.y - lastMouse.y)
+                    if windowMoved < 1.5 && mouseMoved > 25 {
+                        glueActive = false
+                        ambient.isMoving = false
+                        attach(toWindowFrame: frame, anchor: session.anchor, bundleID: session.bundleID, animated: false)
+                        return
+                    }
+                }
+                // 软校正：推算位移和窗口实际位移有系统级的微小出入，会积分成漂移。
+                // 每次只消除 35% 误差，单步几磅不可感知，漂移则被持续压住。
+                let targetCenter = NSPoint(x: frame.maxX - session.anchor.distanceFromRight, y: frame.maxY - session.anchor.distanceFromTop)
+                let targetOrigin = NSPoint(x: targetCenter.x - avatarCenterInCompactPanel.x, y: targetCenter.y - avatarCenterInCompactPanel.y)
+                let applied = clamp(NSRect(origin: targetOrigin, size: panel.frame.size), toScreenNear: targetOrigin).origin
+                panel.setFrameOrigin(NSPoint(
+                    x: panel.frame.origin.x + (applied.x - panel.frame.origin.x) * 0.35,
+                    y: panel.frame.origin.y + (applied.y - panel.frame.origin.y) * 0.35
+                ))
+                lastPositionedWindowFrame = frame
+            }
+            return
+        }
+
+        // 确认阶段：第一个拖动事件就查一次——窗口因按下而动了，爱音当场跟上；
+        // 窗口没动（文本选择等）则继续观察，0.5 秒后放弃等下次按下。
+        let now = Date()
+        if glueActiveSince == nil { glueActiveSince = now }
+        if now.timeIntervalSince(glueActiveSince!) > 0.5 {
+            return
+        }
+        guard let session = glueAnchor() else {
+            return
+        }
+        let isFirstCheck = glueLastQuery == .distantPast
+        if !isFirstCheck, now.timeIntervalSince(glueLastQuery) < 0.015 { return }
+        glueLastQuery = now
+        guard let frame = windowFrame(of: glueTracked!), let frameAtDown = glueFrameAtDown, let downPos = glueMouseAtDown else {
+            return
+        }
+        let windowDelta = NSPoint(x: frame.origin.x - frameAtDown.origin.x, y: frame.origin.y - frameAtDown.origin.y)
+        let mouseDelta = NSPoint(x: pos.x - downPos.x, y: pos.y - downPos.y)
+        if hypot(windowDelta.x, windowDelta.y) > 2,
+           hypot(windowDelta.x - mouseDelta.x, windowDelta.y - mouseDelta.y) < 40 {
+            // 窗口因按下而移动：爱音当场吸附进移动状态，与拖动爱音本体等效。
+            glueActive = true
+            glueLastMouse = pos
+            glueLastVerify = now
+            glueLastVerifiedFrame = nil
+            glueVerifyMouse = nil
+            cancelGlide()
+            ambient.isMoving = true
+            attach(toWindowFrame: frame, anchor: session.anchor, bundleID: session.bundleID, animated: false)
+        }
+        // 窗口没动：不碰爱音，继续观察。
+    }
+
+    private func glueMouseUp() {
+        glueActiveSince = nil
+        glueLastVerifiedFrame = nil
+        glueVerifyMouse = nil
+        guard glueActive else { return }
+        glueActive = false
+        // 退出"长按拖动"状态，与拖动爱音本体松手一致。
+        ambient.isMoving = false
+        // 松手时查一次真实窗口位置，把爱音精确吸回锚点，清掉推算累积的误差。
+        if let tracked = glueTracked,
+           let session = glueAnchor(),
+           let frame = windowFrame(of: tracked) {
+            attach(toWindowFrame: frame, anchor: session.anchor, bundleID: session.bundleID, animated: false)
+        }
+    }
+
+    /// 只查一个窗口的当前位置。注意不能同时传 .optionOnScreenOnly：
+    /// [.optionOnScreenOnly, .optionIncludingWindow] 会把目标上方的所有窗口一并返回，
+    /// 必须只传 .optionIncludingWindow（恰好一行），再用 ID 和 PID 双重校验。
+    private func windowFrame(of tracked: TrackedWindow) -> NSRect? {
+        guard let rows = CGWindowListCopyWindowInfo([.optionIncludingWindow], tracked.id) as? [[String: Any]],
+              let row = rows.first,
+              (row[kCGWindowNumber as String] as? NSNumber)?.uint32Value == tracked.id,
+              (row[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == tracked.pid,
+              (row[kCGWindowIsOnscreen as String] as? Bool) == true,
+              let bounds = row[kCGWindowBounds as String] as? NSDictionary,
+              let cgRect = CGRect(dictionaryRepresentation: bounds) else { return nil }
+        return convertedWindowFrame(from: cgRect)
     }
 
     /// 前台 App 只要有任意一个屏幕上的窗口铺满某块显示器，就算全屏。
@@ -950,20 +1164,28 @@ final class PetPanelController: NSObject, NSApplicationDelegate {
         frontmostApplicationObservation?.invalidate()
     }
 
-    private func frontWindowFrame(for pid: pid_t) -> NSRect? {
+    private func frontWindowFrame(for pid: pid_t) -> (frame: NSRect, windowID: CGWindowID)? {
         guard let rows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
             return nil
         }
-        let candidate = rows.compactMap { row -> CGRect? in
+        var best: (rect: CGRect, id: CGWindowID)?
+        for row in rows {
             guard (row[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == pid,
                   (row[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
                   let bounds = row[kCGWindowBounds as String] as? NSDictionary,
                   let rect = CGRect(dictionaryRepresentation: bounds),
-                  rect.width > 300, rect.height > 200 else { return nil }
-            return rect
-        }.max { $0.width * $0.height < $1.width * $1.height }
-        guard let candidate else { return nil }
+                  rect.width > 300, rect.height > 200 else { continue }
+            let id = (row[kCGWindowNumber as String] as? NSNumber)?.uint32Value ?? 0
+            if best == nil || rect.width * rect.height > best!.rect.width * best!.rect.height {
+                best = (rect, id)
+            }
+        }
+        guard let (candidate, id) = best, let frame = convertedWindowFrame(from: candidate) else { return nil }
+        return (frame, id)
+    }
 
+    /// CG 全局坐标（左上原点）转 Cocoa 屏幕坐标，按显示器缩放比换算。
+    private func convertedWindowFrame(from candidate: CGRect) -> NSRect? {
         for screen in NSScreen.screens {
             guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { continue }
             let displayBounds = CGDisplayBounds(CGDirectDisplayID(number.uint32Value))
