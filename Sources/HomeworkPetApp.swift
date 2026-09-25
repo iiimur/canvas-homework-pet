@@ -777,9 +777,10 @@ final class PetPanelController: NSObject, NSApplicationDelegate {
     /// 前台 App 只要有任意一个屏幕上的窗口铺满某块显示器，就算全屏。
     /// 需要覆盖两类真实全屏、排除一类形似全屏的普通窗口：
     /// - 原生全屏（绿色按钮 / 播放器）：窗口恰好等于整屏，盖住菜单栏条；
-    /// - 网页全屏（B 站等）：窗口贴着菜单栏下方、底边贴屏幕底，且挂在非 0 层级；
-    /// - 平铺/最大化窗口（macOS 窗口平铺等）：几何与网页全屏一样贴着菜单栏下方，
-    ///   但永远在层 0——靠层级把这一类排除掉，避免普通桌面上误隐藏。
+    /// - 网页/客户端视频全屏（B 站实测）：窗口贴着菜单栏下方，但底边一直延伸到
+    ///   屏幕最底边（全屏时 Dock 被藏起来，窗口压住 Dock 区域）；
+    /// - 平铺/最大化窗口：几何与视频全屏几乎一样，但 Dock 还在，窗口停在 Dock
+    ///   上沿、够不到屏幕最底边——靠"是否贴住最底边"排除，避免普通桌面误隐藏。
     private func isAppFullScreen(pid: pid_t) -> Bool {
         guard let rows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
             return false
@@ -796,14 +797,12 @@ final class PetPanelController: NSObject, NSApplicationDelegate {
             guard (row[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == pid,
                   let bounds = row[kCGWindowBounds as String] as? NSDictionary,
                   let rect = CGRect(dictionaryRepresentation: bounds) else { return false }
-            let layer = (row[kCGWindowLayer as String] as? Int) ?? 0
             return displays.contains { display, menuBar in
                 let coversWidth = abs(rect.width - display.width) < slack
-                let flushWithBottom = abs(rect.maxY - display.maxY) < slack
                 let tallEnough = rect.height >= display.height - menuBar - slack
                 let coversMenuBar = rect.minY <= display.minY + 4
-                let webFullScreen = layer != 0 && rect.minY <= display.minY + menuBar + 8
-                return coversWidth && flushWithBottom && tallEnough && (coversMenuBar || webFullScreen)
+                let flushWithBottomEdge = rect.maxY >= display.maxY - 6
+                return coversWidth && tallEnough && (coversMenuBar || flushWithBottomEdge)
             }
         }
     }
