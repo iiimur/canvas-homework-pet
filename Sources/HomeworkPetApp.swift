@@ -766,6 +766,9 @@ final class PetPanelController: NSObject, NSApplicationDelegate {
                 y: targetCenter.y - avatarCenterInCompactPanel.y
             )
             let safeTarget = clamp(NSRect(origin: targetOrigin, size: panel.frame.size), toScreenNear: targetOrigin).origin
+            // restingOrigin 是展开清单时的基准位置，必须跟着锚点一起走，
+            // 否则自动移动后展开，清单还会弹回移动前的旧位置。
+            restingOrigin = safeTarget
             if hypot(panel.frame.origin.x - safeTarget.x, panel.frame.origin.y - safeTarget.y) > 4 {
                 glide(to: safeTarget)
             }
