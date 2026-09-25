@@ -435,6 +435,17 @@ final class PetPanelController: NSObject, NSApplicationDelegate {
         restingOrigin = panel.frame.origin
     }
 
+    /// 已经有一只爱音在跑时，激活旧实例并让新进程退出，避免出现两个桌宠。
+    /// 必须放在 willFinishLaunching：等到 didFinish 时新 panel 已经建好，退掉就晚了。
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        let pid = ProcessInfo.processInfo.processIdentifier
+        guard let bundleID = Bundle.main.bundleIdentifier,
+              let existing = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+                  .first(where: { $0.processIdentifier != pid }) else { return }
+        existing.activate()
+        DispatchQueue.main.async { NSApp.terminate(nil) }
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         UNUserNotificationCenter.current().delegate = self
