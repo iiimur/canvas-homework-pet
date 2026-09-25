@@ -775,19 +775,15 @@ final class PetPanelController: NSObject, NSApplicationDelegate {
     }
 
     /// 前台 App 只要有任意一个屏幕上的窗口铺满某块显示器，就算全屏。
-    /// 两类形态都要覆盖：原生全屏窗口恰好等于整屏；浏览器网页全屏（B 站等）的窗口
-    /// 会留出顶部菜单栏条、底边贴屏幕底。网页全屏窗口常挂在非 0 层级，因此不筛选层级，
-    /// 直接把窗口边界和 CG 显示器边界（同为左上原点坐标系）比对。
-    /// 光看几何会把普通桌面上的平铺/最大化窗口误判成全屏，所以额外要求菜单栏窗口
-    /// （层 24）不在屏：原生全屏 Space 会把菜单栏整个藏起来，满铺窗口做不到。
+    /// 需要覆盖两类真实全屏、排除一类形似全屏的普通窗口：
+    /// - 原生全屏（绿色按钮 / 播放器）：窗口恰好等于整屏，盖住菜单栏条；
+    /// - 网页全屏（B 站等）：窗口贴着菜单栏下方、底边贴屏幕底，且挂在非 0 层级；
+    /// - 平铺/最大化窗口（macOS 窗口平铺等）：几何与网页全屏一样贴着菜单栏下方，
+    ///   但永远在层 0——靠层级把这一类排除掉，避免普通桌面上误隐藏。
     private func isAppFullScreen(pid: pid_t) -> Bool {
         guard let rows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
             return false
         }
-        let menuBarOnscreen = rows.contains {
-            ($0[kCGWindowLayer as String] as? Int) == Int(kCGMainMenuWindowLevel)
-        }
-        if menuBarOnscreen { return false }
         let slack: CGFloat = 12
         let displays = NSScreen.screens.compactMap { screen -> (CGRect, CGFloat)? in
             guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { return nil }
@@ -800,12 +796,14 @@ final class PetPanelController: NSObject, NSApplicationDelegate {
             guard (row[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == pid,
                   let bounds = row[kCGWindowBounds as String] as? NSDictionary,
                   let rect = CGRect(dictionaryRepresentation: bounds) else { return false }
+            let layer = (row[kCGWindowLayer as String] as? Int) ?? 0
             return displays.contains { display, menuBar in
                 let coversWidth = abs(rect.width - display.width) < slack
                 let flushWithBottom = abs(rect.maxY - display.maxY) < slack
-                let topWithinMenuBar = rect.minY <= display.minY + menuBar + 8
                 let tallEnough = rect.height >= display.height - menuBar - slack
-                return coversWidth && flushWithBottom && topWithinMenuBar && tallEnough
+                let coversMenuBar = rect.minY <= display.minY + 4
+                let webFullScreen = layer != 0 && rect.minY <= display.minY + menuBar + 8
+                return coversWidth && flushWithBottom && tallEnough && (coversMenuBar || webFullScreen)
             }
         }
     }
