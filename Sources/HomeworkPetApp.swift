@@ -831,31 +831,17 @@ final class PetPanelController: NSObject, NSApplicationDelegate {
     }
 
     /// 全屏看视频时像系统光标一样自动隐藏；鼠标一动或退出全屏就淡回来。
+    /// 隐藏不用 orderOut：canJoinAllSpaces 窗口被 orderOut 再显示回来时会被 macOS
+    /// 钉死在当时的 Space 上（重新声明 collectionBehavior 也救不回来）。改用透明度
+    /// 归零 + 鼠标穿透，窗口始终留在屏幕上，Space 跟随不受影响。
     private func setPanelHidden(_ hidden: Bool) {
-        // 兜底：任何路径把面板 orderOut 之后状态机又回到可见态时，这里负责把它拉回屏幕。
-        if !hidden, !panel.isVisible { panel.orderFrontRegardless() }
         guard isAutoHidden != hidden else { return }
         isAutoHidden = hidden
-        if hidden {
-            cancelGlide()
-            NSAnimationContext.runAnimationGroup({ context in
-                context.duration = 0.4
-                context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-                panel.animator().alphaValue = 0
-            }, completionHandler: { [weak self] in
-                // NSAnimationContext 的回调固定在主线程执行。
-                MainActor.assumeIsolated {
-                    guard let self, self.isAutoHidden else { return }
-                    self.panel.orderOut(nil)
-                }
-            })
-        } else {
-            panel.orderFrontRegardless()
-            NSAnimationContext.runAnimationGroup { context in
-                context.duration = 0.4
-                context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-                panel.animator().alphaValue = 1
-            }
+        panel.ignoresMouseEvents = hidden
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.4
+            context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            self.panel.animator().alphaValue = hidden ? 0 : 1
         }
     }
 
